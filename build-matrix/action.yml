@@ -73,7 +73,7 @@ runs:
                   }
                 }
               }
-              languages(first: 50) {
+              languages(first: 500) {
                 totalCount
                 pageInfo {
                   hasNextPage
