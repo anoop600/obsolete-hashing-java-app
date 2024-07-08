@@ -1,0 +1,154 @@
+name: PQC Build Dependency Graph Matrix Action
+description: Create a dependency matrix to pass to the PQC Analyze Action
+inputs:
+  repositoryNameWithOwner:
+    description: The base repository to analyze
+    required: false
+    default: ${{ github.repository }}
+  minimumLanguageBytes:
+    description: The minimum number of bytes a language must have to be included in the matrix
+    required: false
+    default: "5000"
+  analyzeDependencies:
+    description: Whether to analyze dependencies
+    required: false
+    default: "false"
+outputs:
+  repositories:
+    description: The repositories to analyze
+    value: ${{ steps.run.outputs.repositories }}
+runs:
+  using: composite
+  steps:
+    - name: Set up env
+      shell: bash
+      run: |
+        # Set up environment variables
+        IFS=/ read -r REPO_OWNER REPO_NAME <<< ${{ inputs.repositoryNameWithOwner }}
+        echo "REPO_OWNER=${REPO_OWNER}" >> "$GITHUB_ENV"
+        echo "REPO_NAME=${REPO_NAME}" >> "$GITHUB_ENV"
+        echo "GH_TOKEN=${{ github.token }}" >> "$GITHUB_ENV"
+    - name: Get dependency graph and code languages
+      id: run
+      shell: bash
+      run: |
+        # Get the dependency graph and code languages
+        echo "::group::Get the dependency graph and code languages"
+        if [[ "${{ inputs.analyzeDependencies }}" == "true" ]]; then
+          QUERY='query getDependencyGraphAndLanguages {
+            repository(owner: "${{ env.REPO_OWNER }}", name: "${{ env.REPO_NAME }}") {
+              nameWithOwner
+              visibility
+              dependencyGraphManifests {
+                totalCount
+                edges {
+                  node {
+                    filename
+                    dependencies {
+                      edges {
+                        node {
+                          packageName
+                          packageManager
+                          requirements
+                          repository {
+                            nameWithOwner
+                            visibility
+                            languages(first: 50) {
+                              totalCount
+                              pageInfo {
+                                hasNextPage
+                                endCursor
+                              }
+                              edges {
+                                size
+                                node {
+                                  name
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+              languages(first: 50) {
+                totalCount
+                pageInfo {
+                  hasNextPage
+                  endCursor
+                }
+                edges {
+                  size
+                  node {
+                    name
+                  }
+                }
+              }
+            }
+          }'
+        else
+          QUERY='query getLanguages {
+            repository(owner: "${{ env.REPO_OWNER }}", name: "${{ env.REPO_NAME }}") {
+              nameWithOwner
+              visibility
+              languages(first: 50) {
+                totalCount
+                pageInfo {
+                  hasNextPage
+                  endCursor
+                }
+                edges {
+                  size
+                  node {
+                    name
+                  }
+                }
+              }
+            }
+          }'
+        fi
+        JSON=$(gh api graphql -H "Accept: application/vnd.github.hawkgirl-preview+json" -f query="${QUERY}")
+        REPOSITORIES=$(jq -c '
+          (
+            [
+              .data.repository as $repository | 
+              .data.repository.languages.edges[] | 
+              select(.size >= ${{ inputs.minimumLanguageBytes }}).node.name |
+              select(. | IN("Python")) as $language | 
+              {
+                nameWithOwner: $repository.nameWithOwner,
+                language: (if $language == "C" then "C++" else $language end),
+                visibility: $repository.visibility
+              } | tostring
+            ]
+          ) as $targetrepo | 
+          (
+            [
+              .data.repository.dependencyGraphManifests.edges[]?.node | 
+              select(.filename | contains(".github/workflows") | not) | 
+              .dependencies.edges[].node.repository as $repository |
+              select($repository != null) | 
+              $repository.languages.edges[] | 
+              select(.size >= ${{ inputs.minimumLanguageBytes }}).node.name |
+              select(. | IN("Python")) as $language | 
+              {
+                nameWithOwner: $repository.nameWithOwner,
+                language: (if $language == "C" then "C++" else $language end),
+                visibility: $repository.visibility
+              } | tostring
+            ]
+          ) as $dependencyrepos | 
+          $targetrepo + $dependencyrepos | unique
+        ' <<< ${JSON} \
+        | sed 's/\\\"C\\\"/\\\"cpp\\\"/g; s/\\\"C++\\\"/\\\"cpp\\\"/g; s/\\\"C#\\\"/\\\"csharp\\\"/g' \
+        | tr "[:upper:]" "[:lower:]")
+        if [[ $(jq length <<< "${REPOSITORIES}") -eq 0 ]]; then
+          echo "No suitable repositories found, maybe no supported languages detected?"
+          exit 1
+        else
+          echo "Result: ${REPOSITORIES}"
+          echo "repositories=${REPOSITORIES}" >> "$GITHUB_OUTPUT"
+        fi
+        echo "::endgroup::"
